@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 
+import { eventFrom, hubProjectOf, postToServer } from '../../skills/artifacts/app/agent-event.cjs';
 import { projectRoot } from '../../skills/artifacts/app/comment-subscriptions.cjs';
 import { wakeMessage } from '../../skills/artifacts/app/comment-watch.cjs';
 import { openHubChannel } from '../../skills/artifacts/app/hub-channel.cjs';
@@ -21,6 +22,48 @@ let cachedBootstrap: string | null | undefined;
 export default function ryugiPiExtension(pi: ExtensionAPI) {
   let injectBootstrap = true;
   let channel: { close: () => void } | undefined;
+  let cachedProject: { cwd: string; root: string } | undefined;
+  let lastEventAt = 0;
+  const activeTools = new Set<string>();
+  const inFlightReports = new Set<Promise<void>>();
+
+  const resolveProject = (cwd: string): string => {
+    if (cachedProject?.cwd === cwd) return cachedProject.root;
+    const root = projectRoot(cwd);
+    cachedProject = { cwd, root };
+    return root;
+  };
+
+  const reportStatus = (
+    ctx: ExtensionContext,
+    hookEventName: string,
+    extra?: Record<string, unknown>,
+  ): Promise<void> => {
+    const task = (async () => {
+      try {
+        // Strictly increasing so same-ms posts cannot overwrite newer state.
+        const at = Math.max(Date.now(), lastEventAt + 1);
+        lastEventAt = at;
+        const body = eventFrom(
+          {
+            session_id: ctx.sessionManager.getSessionId(),
+            hook_event_name: hookEventName,
+            cwd: ctx.cwd,
+            ...extra,
+          },
+          'pi',
+          at,
+        );
+        if (!body) return;
+        await postToServer(hubProjectOf(resolveProject(ctx.cwd)), '/api/agent/event', body);
+      } catch {
+        // Best effort.
+      }
+    })();
+    inFlightReports.add(task);
+    void task.finally(() => inFlightReports.delete(task));
+    return task;
+  };
 
   const stopCommentWatch = () => {
     channel?.close();
@@ -29,12 +72,42 @@ export default function ryugiPiExtension(pi: ExtensionAPI) {
 
   pi.on('session_start', async (_event, ctx) => {
     injectBootstrap = true;
+    cachedProject = undefined;
+    activeTools.clear();
     stopCommentWatch();
-    channel = watchComments(pi, ctx, projectRoot(ctx.cwd), ctx.sessionManager.getSessionId());
+    channel = watchComments(pi, ctx, resolveProject(ctx.cwd), ctx.sessionManager.getSessionId());
   });
 
-  pi.on('session_shutdown', async () => {
+  pi.on('session_shutdown', async (event, ctx) => {
     stopCommentWatch();
+    activeTools.clear();
+    // Reload keeps the session alive; drain in-flight posts so Stop cannot arrive after SessionEnd.
+    if (event?.reason !== 'reload') {
+      if (inFlightReports.size > 0) await Promise.all(inFlightReports);
+      await reportStatus(ctx, 'SessionEnd');
+    }
+  });
+
+  pi.on('agent_start', (_event, ctx) => {
+    void reportStatus(ctx, 'UserPromptSubmit');
+  });
+
+  pi.on('tool_execution_start', (event, ctx) => {
+    if (event.toolCallId) activeTools.add(event.toolCallId);
+    void reportStatus(ctx, 'PreToolUse', {
+      tool_name: event.toolName,
+      tool_input: event.args,
+    });
+  });
+
+  pi.on('tool_execution_end', (event, ctx) => {
+    if (event.toolCallId) activeTools.delete(event.toolCallId);
+    if (activeTools.size === 0) void reportStatus(ctx, 'PostToolUse');
+  });
+
+  pi.on('agent_settled', (_event, ctx) => {
+    activeTools.clear();
+    void reportStatus(ctx, 'Stop');
   });
 
   pi.on('session_compact', async () => {

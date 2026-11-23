@@ -104,7 +104,7 @@ function eventFrom(input, host, at = Date.now()) {
       : typeof input.hookEventName === 'string' && input.hookEventName
         ? input.hookEventName
         : null;
-  if (!session || !rawEvent) return null;
+  if (!session || session.length > 200 || !rawEvent) return null;
   if (
     rawEvent === 'PreInvocation' &&
     typeof input.invocationNum === 'number' &&
@@ -118,7 +118,9 @@ function eventFrom(input, host, at = Date.now()) {
       : host;
   const event = { host: resolvedHost, session, event: eventName, at };
   if (eventName === 'PreToolUse') {
-    event.paths = pathsOf(input).slice(0, 64);
+    event.paths = pathsOf(input)
+      .filter((file) => file.length <= 4096)
+      .slice(0, 64);
     const toolName =
       typeof input.tool_name === 'string'
         ? input.tool_name

@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
+import http from 'node:http';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 import test, { after } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -74,7 +75,17 @@ test('extension leaves package skill discovery to Pi and registers lifecycle hoo
     0,
     'extension must not bypass package skill filters',
   );
-  for (const event of ['session_start', 'session_compact', 'context', 'agent_end']) {
+  for (const event of [
+    'session_start',
+    'session_shutdown',
+    'agent_start',
+    'tool_execution_start',
+    'tool_execution_end',
+    'agent_settled',
+    'session_compact',
+    'context',
+    'agent_end',
+  ]) {
     assert.equal((handlers.get(event) ?? []).length, 1, `missing ${event} handler`);
   }
   assert.equal((handlers.get('session_before_compact') ?? []).length, 0);
@@ -352,4 +363,283 @@ test('a Pi subscription does not guess its host from inherited or conflicting se
     /ambiguous agent session markers/,
   );
   assert.equal(hostOf({ PI_SESSION_ID: ids.PI_SESSION_ID }), 'pi');
+});
+
+function statusHub(t, root, { onEvent } = {}) {
+  const seen = [];
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (chunk) => (body += chunk));
+    req.on('end', async () => {
+      const entry = {
+        method: req.method,
+        path: req.url.split('?')[0],
+        key: new URL(req.url, 'http://127.0.0.1').searchParams.get('key'),
+        project: decodeURIComponent(req.headers['x-ryugi-project'] || ''),
+        body: body ? JSON.parse(body) : null,
+      };
+      if (onEvent) await onEvent(entry);
+      seen.push(entry);
+      res.statusCode = 204;
+      res.end();
+    });
+  });
+  return new Promise((resolveHub) => {
+    server.listen(0, '127.0.0.1', () => {
+      t.after(() => {
+        server.closeAllConnections();
+        server.close();
+      });
+      mkdirSync(join(root, '.ryugi/artifacts/.state'), { recursive: true });
+      writeFileSync(
+        join(root, '.ryugi/artifacts/.state/server-info'),
+        JSON.stringify({ url: 'http://127.0.0.1:' + server.address().port + '/?key=test' }),
+      );
+      resolveHub(seen);
+    });
+  });
+}
+
+function statusEvent(seen) {
+  assert.equal(seen.length, 1, 'expected exactly one status event');
+  const [{ method, path, key, project: posted, body }] = seen;
+  assert.equal(method, 'POST');
+  assert.equal(path, '/api/agent/event');
+  assert.equal(key, 'test', 'the hub key from server-info is forwarded');
+  assert.equal(typeof body.at, 'number');
+  return { posted, body: { ...body, at: undefined } };
+}
+
+test('agent_start reports UserPromptSubmit for the Pi session', async (t) => {
+  const { root } = project(t);
+  const seen = await statusHub(t, root);
+  const { handlers } = await loadExtension();
+
+  await firstHandler(handlers, 'agent_start')({ type: 'agent_start' }, sessionContext(root));
+  await until(() => seen.length === 1, 'UserPromptSubmit reaches the hub');
+
+  const { posted, body } = statusEvent(seen);
+  assert.equal(posted, root);
+  assert.deepEqual(body, { host: 'pi', session, event: 'UserPromptSubmit', at: undefined });
+});
+
+test('tool_execution_start reports PreToolUse with the tool name and absolute deduplicated paths', async (t) => {
+  const { root } = project(t);
+  const seen = await statusHub(t, root);
+  const { handlers } = await loadExtension();
+  const file = join(root, 'src/app.ts');
+
+  await firstHandler(handlers, 'tool_execution_start')(
+    {
+      type: 'tool_execution_start',
+      toolCallId: 'call-1',
+      toolName: 'edit',
+      args: { path: 'src/app.ts', file_path: file, notebook_path: 'notes/plan.md' },
+    },
+    sessionContext(root),
+  );
+  await until(() => seen.length === 1, 'PreToolUse reaches the hub');
+
+  const { body } = statusEvent(seen);
+  assert.deepEqual(body, {
+    host: 'pi',
+    session,
+    event: 'PreToolUse',
+    at: undefined,
+    tool: 'edit',
+    paths: [file, join(root, 'notes/plan.md')],
+  });
+});
+
+test('a PreToolUse touching more than 64 files reports at most 64 absolute paths', async (t) => {
+  const { root } = project(t);
+  const seen = await statusHub(t, root);
+  const { handlers } = await loadExtension();
+  const patch = Array.from({ length: 70 }, (_, i) => '*** Add File: src/f' + i + '.ts').join('\n');
+
+  await firstHandler(handlers, 'tool_execution_start')(
+    {
+      type: 'tool_execution_start',
+      toolCallId: 'call-2',
+      toolName: 'bash',
+      args: { command: patch },
+    },
+    sessionContext(root),
+  );
+  await until(() => seen.length === 1, 'PreToolUse reaches the hub');
+
+  const { body } = statusEvent(seen);
+  assert.equal(body.tool, 'bash');
+  assert.equal(body.paths.length, 64);
+  assert.ok(body.paths.every((entry) => isAbsolute(entry)));
+  assert.equal(body.paths[0], join(root, 'src/f0.ts'));
+});
+
+test('tool_execution_end reports PostToolUse for successful and failed tools', async (t) => {
+  const { root } = project(t);
+  const seen = await statusHub(t, root);
+  const { handlers } = await loadExtension();
+
+  await firstHandler(handlers, 'tool_execution_end')(
+    { type: 'tool_execution_end', toolCallId: 'call-1', toolName: 'bash', result: {}, isError: true },
+    sessionContext(root),
+  );
+  await until(() => seen.length === 1, 'PostToolUse reaches the hub');
+
+  const { body } = statusEvent(seen);
+  assert.deepEqual(body, { host: 'pi', session, event: 'PostToolUse', at: undefined });
+});
+
+test('agent_settled reports Stop so the hub knows it is the human turn again', async (t) => {
+  const { root } = project(t);
+  const seen = await statusHub(t, root);
+  const { handlers } = await loadExtension();
+
+  await firstHandler(handlers, 'agent_settled')(
+    { type: 'agent_settled', aborted: false },
+    sessionContext(root),
+  );
+  await until(() => seen.length === 1, 'Stop reaches the hub');
+
+  const { body } = statusEvent(seen);
+  assert.deepEqual(body, { host: 'pi', session, event: 'Stop', at: undefined });
+});
+
+test('session_shutdown waits for SessionEnd to reach the hub before returning', async (t) => {
+  const { root } = project(t);
+  const seen = await statusHub(t, root);
+  const { handlers } = await loadExtension();
+
+  await firstHandler(handlers, 'session_shutdown')(
+    { type: 'session_shutdown', reason: 'quit' },
+    sessionContext(root),
+  );
+
+  assert.equal(seen.length, 1, 'the request arrived before the handler resolved');
+  const { body } = statusEvent(seen);
+  assert.deepEqual(body, { host: 'pi', session, event: 'SessionEnd', at: undefined });
+});
+
+test('a reload keeps the session alive and reports no SessionEnd', async (t) => {
+  const { root } = project(t);
+  const seen = await statusHub(t, root);
+  const { handlers } = await loadExtension();
+
+  await firstHandler(handlers, 'session_shutdown')(
+    { type: 'session_shutdown', reason: 'reload' },
+    sessionContext(root),
+  );
+  assert.deepEqual(seen, [], 'a reloaded session is still running');
+});
+
+test('an unresolvable cwd makes projectRoot throw without escaping or posting', async (t) => {
+  const { root } = project(t);
+  const seen = await statusHub(t, root);
+  const { handlers } = await loadExtension();
+  const bare = realpathSync(mkdtempSync(join(tmpdir(), 'ryugi-pi-bare-')));
+  t.after(() => rmSync(bare, { recursive: true, force: true }));
+
+  await firstHandler(handlers, 'session_shutdown')(
+    { type: 'session_shutdown', reason: 'quit' },
+    sessionContext(join(bare, 'gone')),
+  );
+  assert.deepEqual(seen, [], 'a thrown projectRoot never reaches the hub');
+});
+
+test('rapid consecutive events carry strictly increasing timestamps', async (t) => {
+  const { root } = project(t);
+  const seen = await statusHub(t, root);
+  const { handlers } = await loadExtension();
+  const ctx = sessionContext(root);
+  const realNow = Date.now;
+  Date.now = () => 1_700_000_000_000;
+  t.after(() => {
+    Date.now = realNow;
+  });
+
+  firstHandler(handlers, 'agent_start')({ type: 'agent_start' }, ctx);
+  firstHandler(handlers, 'tool_execution_start')(
+    { type: 'tool_execution_start', toolCallId: 'call-1', toolName: 'read', args: { path: 'a.ts' } },
+    ctx,
+  );
+  firstHandler(handlers, 'tool_execution_end')(
+    { type: 'tool_execution_end', toolCallId: 'call-1', toolName: 'read', result: {}, isError: false },
+    ctx,
+  );
+  firstHandler(handlers, 'agent_settled')({ type: 'agent_settled', aborted: false }, ctx);
+  await until(() => seen.length === 4, 'all four events reach the hub');
+
+  const byEvent = Object.fromEntries(seen.map((entry) => [entry.body.event, entry.body.at]));
+  assert.ok(byEvent.UserPromptSubmit < byEvent.PreToolUse);
+  assert.ok(byEvent.PreToolUse < byEvent.PostToolUse);
+  assert.ok(byEvent.PostToolUse < byEvent.Stop);
+});
+
+test('parallel or nested tool calls report PostToolUse only after the last call ends', async (t) => {
+  const { root } = project(t);
+  const seen = await statusHub(t, root);
+  const { handlers } = await loadExtension();
+  const ctx = sessionContext(root);
+
+  firstHandler(handlers, 'tool_execution_start')(
+    { type: 'tool_execution_start', toolCallId: 'outer', toolName: 'codemode', args: {} },
+    ctx,
+  );
+  firstHandler(handlers, 'tool_execution_start')(
+    {
+      type: 'tool_execution_start',
+      toolCallId: 'inner',
+      parentToolCallId: 'outer',
+      toolName: 'edit',
+      args: { path: 'src/app.ts' },
+    },
+    ctx,
+  );
+  firstHandler(handlers, 'tool_execution_end')(
+    {
+      type: 'tool_execution_end',
+      toolCallId: 'inner',
+      parentToolCallId: 'outer',
+      toolName: 'edit',
+      result: {},
+      isError: false,
+    },
+    ctx,
+  );
+  await until(() => seen.length === 2, 'both PreToolUse events reach the hub');
+  assert.deepEqual(
+    seen.map((entry) => entry.body.event),
+    ['PreToolUse', 'PreToolUse'],
+    'ending an inner call while outer is still active must not emit PostToolUse',
+  );
+
+  firstHandler(handlers, 'tool_execution_end')(
+    { type: 'tool_execution_end', toolCallId: 'outer', toolName: 'codemode', result: {}, isError: false },
+    ctx,
+  );
+  await until(() => seen.length === 3, 'PostToolUse reaches the hub after the last active tool ends');
+  assert.equal(seen[2].body.event, 'PostToolUse');
+});
+
+test('session_shutdown drains an in-flight Stop before posting SessionEnd', async (t) => {
+  const { root } = project(t);
+  const seen = await statusHub(t, root, {
+    onEvent: async (entry) => {
+      if (entry.body?.event === 'Stop') await delay(80);
+    },
+  });
+  const { handlers } = await loadExtension();
+  const ctx = sessionContext(root);
+
+  firstHandler(handlers, 'agent_settled')({ type: 'agent_settled', aborted: false }, ctx);
+  await firstHandler(handlers, 'session_shutdown')(
+    { type: 'session_shutdown', reason: 'quit' },
+    ctx,
+  );
+
+  assert.deepEqual(
+    seen.map((entry) => entry.body.event),
+    ['Stop', 'SessionEnd'],
+    'SessionEnd must arrive after Stop so the hub does not revive an ended session',
+  );
 });

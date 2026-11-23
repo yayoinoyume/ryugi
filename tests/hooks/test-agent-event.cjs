@@ -425,3 +425,48 @@ test('the Stop hook in a linked worktree without its own hub ends the turn on th
   assert.equal(event?.project, main);
   assert.equal(event?.body.event, 'Stop');
 });
+
+test('eventFrom enforces the hub field limits across all hosts', () => {
+  const { eventFrom } = require(path.join(repo, 'skills/artifacts/app/agent-event.cjs'));
+  assert.equal(
+    eventFrom({ hook_event_name: 'UserPromptSubmit', session_id: 's'.repeat(201) }, 'pi', 1),
+    null,
+  );
+
+  const cwd = path.resolve(os.tmpdir(), 'ryugi-limit-check');
+  const patch = Array.from({ length: 70 }, (_, i) => '*** Add File: src/f' + i + '.ts').join('\n');
+  const event = eventFrom(
+    {
+      hook_event_name: 'PreToolUse',
+      session_id: SESSION,
+      tool_name: 'x'.repeat(65),
+      tool_input: {
+        path: 'src/ok.ts',
+        file_path: path.join(cwd, 'a'.repeat(4200)),
+        command: patch,
+      },
+      cwd,
+    },
+    'pi',
+    123,
+  );
+  assert.equal(event.host, 'pi');
+  assert.equal(event.at, 123);
+  assert.equal('tool' in event, false);
+  assert.equal(event.paths.length, 64);
+  assert.ok(event.paths.every((file) => file.length <= 4096));
+  assert.equal(event.paths[0], path.join(cwd, 'src/ok.ts'));
+
+  const emptyTool = eventFrom(
+    {
+      hook_event_name: 'PreToolUse',
+      session_id: SESSION,
+      tool_name: '',
+      tool_input: { path: 'src/ok.ts' },
+      cwd,
+    },
+    'claude',
+    124,
+  );
+  assert.equal('tool' in emptyTool, false);
+});

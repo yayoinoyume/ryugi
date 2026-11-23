@@ -248,6 +248,19 @@ watch follows the session through `/reload`, stops when the session ends,
 and a delivery failure shows a warning instead of stopping Pi. Tested on
 Pi 1.4.0.
 
+The extension also reports the session to the local hub's
+`/api/agent/event`, so an Artboard shows it as thinking, running a tool,
+your turn, or gone when the session ends, as it does for Claude Code and
+Codex. Each event carries `host: 'pi'`, Pi's session ID and a timestamp.
+`agent_start` sends `UserPromptSubmit`; `tool_execution_start` sends
+`PreToolUse` with the tool name and up to 64 file paths;
+`tool_execution_end` sends `PostToolUse` once no other tool calls remain
+active; `agent_settled` sends `Stop`; `session_shutdown` drains any
+in-flight status posts and then sends `SessionEnd`; a `/reload` keeps the
+session alive and reports nothing. Reporting is best effort: a missing or
+rejecting hub never blocks a turn or fails the session (only shutdown
+waits up to 1.5s per request).
+
 Known limits:
 
 - A Pi started inside a Codex or Claude Code session inherits their session
@@ -269,6 +282,16 @@ Known limits:
   lists the comments marks them read for the others.
 - The viewer's "terminal is listening" hint stays off for Pi.
 - A session's list of opened artifacts only grows.
+- Pi has no permission events. The hub shows `PreToolUse` as waiting for
+  approval only for `AskUserQuestion`, `ExitPlanMode` and `ask_question`,
+  which Pi's tools do not use.
+- `agent_start` also fires for comment wake-ups and automatic
+  continuations, so each reports `UserPromptSubmit`.
+- A session killed with `SIGKILL` reports no `SessionEnd`, so the Artboard
+  keeps whatever it last showed until the project's hub server is unloaded
+  and the idle entry expires (30 minutes for `thinking`/`running`, 8 hours
+  for `your-turn`/`needs-approval`), that same session is resumed and runs
+  again (or exits cleanly), or the hub restarts.
 
 ## Qwen Code
 
